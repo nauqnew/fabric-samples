@@ -50,7 +50,10 @@ CHANNEL_NAME=mychannel
 # Query timeout in seconds
 QUERY_TIMEOUT=15
 
-# Log directory 
+# Setup timeout in seconds (for setup container to complete)
+SETUP_TIMEOUT=120
+
+# Log directory
 LOGDIR=$DATA/logs
 LOGPATH=/$LOGDIR
 
@@ -74,6 +77,13 @@ export FABRIC_CA_CLIENT_ID_AFFILIATION=org1
 
 # Set to true to enable use of intermediate CAs
 USE_INTERMEDIATE_CA=true
+
+
+# Config block file path
+CONFIG_BLOCK_FILE=/tmp/config_block.pb
+
+# Update config block payload file path
+CONFIG_UPDATE_ENVELOPE_FILE=/tmp/config_update_as_envelope.pb
 
 # initOrgVars <ORG>
 function initOrgVars {
@@ -117,7 +127,7 @@ function initOrgVars {
    ORG_ADMIN_CERT=${ORG_MSP_DIR}/admincerts/cert.pem
    ORG_ADMIN_HOME=/${DATA}/orgs/$ORG/admin
 
-   if $USE_INTERMEDIATE_CA; then
+   if test "$USE_INTERMEDIATE_CA" = "true"; then
       CA_NAME=$INT_CA_NAME
       CA_HOST=$INT_CA_HOST
       CA_CHAINFILE=$INT_CA_CHAINFILE
@@ -159,7 +169,26 @@ function initOrdererVars {
    TLSDIR=$MYHOME/tls
    export ORDERER_GENERAL_TLS_PRIVATEKEY=$TLSDIR/server.key
    export ORDERER_GENERAL_TLS_CERTIFICATE=$TLSDIR/server.crt
-   export ORDERER_GENERAL_TLS_ROOTCAS=[$INT_CA_CHAINFILE]
+   export ORDERER_GENERAL_TLS_ROOTCAS=[$CA_CHAINFILE]
+}
+
+function genClientTLSCert {
+   if [ $# -ne 3 ]; then
+      echo "Usage: genClientTLSCert <host name> <cert file> <key file>: $*"
+      exit 1
+   fi
+
+   HOST_NAME=$1
+   CERT_FILE=$2
+   KEY_FILE=$3
+
+   # Get a client cert
+   fabric-ca-client enroll -d --enrollment.profile tls -u $ENROLLMENT_URL -M /tmp/tls --csr.hosts $HOST_NAME
+
+   mkdir /$DATA/tls || true
+   cp /tmp/tls/signcerts/* $CERT_FILE
+   cp /tmp/tls/keystore/* $KEY_FILE
+   rm -rf /tmp/tls
 }
 
 # initPeerVars <ORG> <NUM>
@@ -191,10 +220,11 @@ function initPeerVars {
    # export CORE_LOGGING_LEVEL=ERROR
    export CORE_LOGGING_LEVEL=DEBUG
    export CORE_PEER_TLS_ENABLED=true
+   export CORE_PEER_TLS_CLIENTAUTHREQUIRED=true
+   export CORE_PEER_TLS_ROOTCERT_FILE=$CA_CHAINFILE
+   export CORE_PEER_TLS_CLIENTCERT_FILE=/$DATA/tls/$PEER_NAME-cli-client.crt
+   export CORE_PEER_TLS_CLIENTKEY_FILE=/$DATA/tls/$PEER_NAME-cli-client.key
    export CORE_PEER_PROFILE_ENABLED=true
-   export CORE_PEER_TLS_CERT_FILE=$TLSDIR/server.crt
-   export CORE_PEER_TLS_KEY_FILE=$TLSDIR/server.key
-   export CORE_PEER_TLS_ROOTCERT_FILE=$INT_CA_CHAINFILE
    # gossip variables
    export CORE_PEER_GOSSIP_USELEADERELECTION=true
    export CORE_PEER_GOSSIP_ORGLEADER=false
@@ -203,12 +233,13 @@ function initPeerVars {
       # Point the non-anchor peers to the anchor peer, which is always the 1st peer
       export CORE_PEER_GOSSIP_BOOTSTRAP=peer1-${ORG}:7051
    fi
+   export ORDERER_CONN_ARGS="$ORDERER_PORT_ARGS --keyfile $CORE_PEER_TLS_CLIENTKEY_FILE --certfile $CORE_PEER_TLS_CLIENTCERT_FILE"
 }
 
 # Switch to the current org's admin identity.  Enroll if not previously enrolled.
 function switchToAdminIdentity {
    if [ ! -d $ORG_ADMIN_HOME ]; then
-      dowait "$CA_NAME to start" 10 $CA_LOGFILE $CA_CHAINFILE
+      dowait "$CA_NAME to start" 60 $CA_LOGFILE $CA_CHAINFILE
       log "Enrolling admin '$ADMIN_NAME' with $CA_HOST ..."
       export FABRIC_CA_CLIENT_HOME=$ORG_ADMIN_HOME
       export FABRIC_CA_CLIENT_TLS_CERTFILES=$CA_CHAINFILE
@@ -229,7 +260,7 @@ function switchToUserIdentity {
    export FABRIC_CA_CLIENT_HOME=/etc/hyperledger/fabric/orgs/$ORG/user
    export CORE_PEER_MSPCONFIGPATH=$FABRIC_CA_CLIENT_HOME/msp
    if [ ! -d $FABRIC_CA_CLIENT_HOME ]; then
-      dowait "$CA_NAME to start" 10 $CA_LOGFILE $CA_CHAINFILE
+      dowait "$CA_NAME to start" 60 $CA_LOGFILE $CA_CHAINFILE
       log "Enrolling user for organization $ORG with home directory $FABRIC_CA_CLIENT_HOME ..."
       export FABRIC_CA_CLIENT_TLS_CERTFILES=$CA_CHAINFILE
       fabric-ca-client enroll -d -u https://$USER_NAME:$USER_PASS@$CA_HOST:7054
@@ -242,6 +273,25 @@ function switchToUserIdentity {
    fi
 }
 
+# Revokes the fabric user
+function revokeFabricUserAndGenerateCRL {
+   switchToAdminIdentity
+   export  FABRIC_CA_CLIENT_HOME=$ORG_ADMIN_HOME
+   logr "Revoking the user '$USER_NAME' of the organization '$ORG' with Fabric CA Client home directory set to $FABRIC_CA_CLIENT_HOME and generating CRL ..."
+   export FABRIC_CA_CLIENT_TLS_CERTFILES=$CA_CHAINFILE
+   fabric-ca-client revoke -d --revoke.name $USER_NAME --gencrl
+}
+
+# Generates a CRL that contains serial numbers of all revoked enrollment certificates.
+# The generated CRL is placed in the crls folder of the admin's MSP
+function generateCRL {
+   switchToAdminIdentity
+   export FABRIC_CA_CLIENT_HOME=$ORG_ADMIN_HOME
+   logr "Generating CRL for the organization '$ORG' with Fabric CA Client home directory set to $FABRIC_CA_CLIENT_HOME ..."
+   export FABRIC_CA_CLIENT_TLS_CERTFILES=$CA_CHAINFILE
+   fabric-ca-client gencrl -d
+}
+
 # Copy the org's admin cert into some target MSP directory
 # This is only required if ADMINCERTS is enabled.
 function copyAdminCert {
@@ -251,7 +301,7 @@ function copyAdminCert {
    if $ADMINCERTS; then
       dstDir=$1/admincerts
       mkdir -p $dstDir
-      dowait "$ORG administator to enroll" 10 $SETUP_LOGFILE $ORG_ADMIN_CERT
+      dowait "$ORG administator to enroll" 60 $SETUP_LOGFILE $ORG_ADMIN_CERT
       cp $ORG_ADMIN_CERT $dstDir
    fi
 }
@@ -273,7 +323,7 @@ function finishMSPSetup {
 }
 
 function awaitSetup {
-   dowait "the 'setup' container to finish registering identities, creating the genesis block and other artifacts" $1 $SETUP_LOGFILE /$SETUP_SUCCESS_FILE
+   dowait "the 'setup' container to finish registering identities, creating the genesis block and other artifacts" $SETUP_TIMEOUT $SETUP_LOGFILE /$SETUP_SUCCESS_FILE
 }
 
 # Wait for one or more files to exist
@@ -304,6 +354,36 @@ function dowait {
    done
    echo ""
 }
+
+# Wait for a process to begin to listen on a particular host and port
+# Usage: waitPort <what> <timeoutInSecs> <errorLogFile> <host> <port>
+function waitPort {
+   set +e
+   local what=$1
+   local secs=$2
+   local logFile=$3
+   local host=$4
+   local port=$5
+   nc -z $host $port > /dev/null 2>&1
+   if [ $? -ne 0 ]; then
+      log -n "Waiting for $what ..."
+      local starttime=$(date +%s)
+      while true; do
+         sleep 1
+         nc -z $host $port > /dev/null 2>&1
+         if [ $? -eq 0 ]; then
+            break
+         fi
+         if [ "$(($(date +%s)-starttime))" -gt "$secs" ]; then
+            fatal "Failed waiting for $what; see $logFile"
+         fi
+         echo -n "."
+      done
+      echo ""
+   fi
+   set -e
+}
+
 
 # log a message
 function log {
